@@ -7626,7 +7626,7 @@ class ProviderConfigManager:
     def _get_cohere_config(model: str) -> BaseConfig:
         """Get Cohere config based on route."""
         CohereModelInfo = getattr(sys.modules[__name__], 'CohereModelInfo')
-            route = CohereModelInfo.get_cohere_route(model)
+        route = CohereModelInfo.get_cohere_route(model)
         if route == "v2":
             return litellm.CohereV2ChatConfig()
         return litellm.CohereChatConfig()
