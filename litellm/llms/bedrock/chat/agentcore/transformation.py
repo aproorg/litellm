@@ -216,8 +216,11 @@ class AmazonAgentCoreConfig(BaseConfig, BaseAWSLLM):
             f"AgentCore transform_request - optional_params keys: {list(optional_params.keys())}"
         )
 
-        # Use the last message content as the prompt
-        prompt = convert_content_list_to_str(messages[-1])
+        # Build prompt from all messages.
+        # AgentCore's InvokeAgentRuntime API accepts a single "prompt" string,
+        # so we prepend system/instruction messages before the user message
+        # to ensure they are passed through to the agent.
+        prompt = self._build_prompt_from_messages(messages)
 
         # Create the payload - this is what goes in the body (raw JSON)
         payload: dict = {"prompt": prompt}
@@ -236,6 +239,51 @@ class AmazonAgentCoreConfig(BaseConfig, BaseAWSLLM):
 
         verbose_logger.debug(f"PAYLOAD: {payload}")
         return payload
+
+    def _build_prompt_from_messages(self, messages: List[AllMessageValues]) -> str:
+        """
+        Build a single prompt string from OpenAI-format messages.
+
+        AgentCore's InvokeAgentRuntime API accepts a flat prompt string, not a
+        messages array.  When callers include system messages (e.g. custom agent
+        instructions from LibreChat), we prepend them so the underlying agent
+        receives the full context.
+
+        If only a single user message is present (the common case), it is
+        returned as-is with no extra formatting.
+        """
+        system_parts: List[str] = []
+        user_parts: List[str] = []
+
+        for message in messages:
+            role = message.get("role", "")
+            content = convert_content_list_to_str(message)
+            if not content:
+                continue
+
+            if role in ("system", "developer"):
+                system_parts.append(content)
+            elif role == "user":
+                user_parts.append(content)
+            # assistant messages are prior turns — skip for prompt construction
+
+        # Fast path: no system messages, return user content directly
+        if not system_parts:
+            # Use the last user message (matches previous behaviour)
+            if user_parts:
+                return user_parts[-1]
+            # Fallback: use last message regardless of role
+            return convert_content_list_to_str(messages[-1])
+
+        # Combine system instructions + user message
+        system_text = "\n".join(system_parts)
+        user_text = user_parts[-1] if user_parts else ""
+
+        prompt = f"<system>\n{system_text}\n</system>\n\n{user_text}"
+        verbose_logger.debug(
+            "AgentCore: prepended system prompt to user message"
+        )
+        return prompt
 
     def _extract_sse_json(self, line: str) -> Optional[Dict]:
         """Extract and parse JSON from an SSE data line."""

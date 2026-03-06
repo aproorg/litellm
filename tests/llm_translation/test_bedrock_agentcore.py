@@ -1152,3 +1152,120 @@ def test_agentcore_streaming_top_level_reasoning_still_works():
     assert len(content_chunks) == 1
     assert content_chunks[0].choices[0].delta.content == "The answer."
 
+
+def test_agentcore_system_prompt_included_in_payload():
+    """
+    System messages should be prepended to the prompt so that custom agent
+    instructions (e.g. from LibreChat agent builder) are passed through to
+    the AgentCore agent.
+    """
+    import json
+
+    litellm._turn_on_debug()
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+
+    client = HTTPHandler()
+
+    with patch.object(client, "post", return_value=MagicMock()) as mock_post:
+        try:
+            litellm.completion(
+                model="bedrock/agentcore/arn:aws:bedrock-agentcore:us-west-2:888602223428:runtime/hosted_agent_r9jvp-3ySZuRHjLC",
+                messages=[
+                    {"role": "system", "content": "You are a helpful coding assistant."},
+                    {"role": "user", "content": "Write hello world in Python"},
+                ],
+                api_key="test-jwt-token-header.payload.signature",
+                client=client,
+            )
+        except Exception as e:
+            print(f"Error: {e}")
+
+        mock_post.assert_called_once()
+        call_kwargs = mock_post.call_args.kwargs
+
+        request_data = json.loads(call_kwargs["data"])
+        prompt = request_data["prompt"]
+        # System content must appear in the prompt
+        assert "You are a helpful coding assistant." in prompt
+        # User content must also appear
+        assert "Write hello world in Python" in prompt
+
+
+def test_agentcore_no_system_prompt_unchanged():
+    """
+    When there is no system message, the prompt should be the user message
+    content only (no extra wrapping).
+    """
+    import json
+
+    litellm._turn_on_debug()
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+
+    client = HTTPHandler()
+
+    with patch.object(client, "post", return_value=MagicMock()) as mock_post:
+        try:
+            litellm.completion(
+                model="bedrock/agentcore/arn:aws:bedrock-agentcore:us-west-2:888602223428:runtime/hosted_agent_r9jvp-3ySZuRHjLC",
+                messages=[
+                    {"role": "user", "content": "Hello"},
+                ],
+                api_key="test-jwt-token-header.payload.signature",
+                client=client,
+            )
+        except Exception as e:
+            print(f"Error: {e}")
+
+        mock_post.assert_called_once()
+        call_kwargs = mock_post.call_args.kwargs
+
+        request_data = json.loads(call_kwargs["data"])
+        # Without system messages, prompt should be the raw user message
+        assert request_data["prompt"] == "Hello"
+
+
+def test_agentcore_build_prompt_unit():
+    """
+    Unit test for _build_prompt_from_messages covering edge cases.
+    """
+    from litellm.llms.bedrock.chat.agentcore.transformation import AmazonAgentCoreConfig
+
+    config = AmazonAgentCoreConfig()
+
+    # Case 1: system + user
+    messages = [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "What is 2+2?"},
+    ]
+    prompt = config._build_prompt_from_messages(messages)
+    assert "<system>" in prompt
+    assert "Be concise." in prompt
+    assert "What is 2+2?" in prompt
+
+    # Case 2: multiple system messages
+    messages = [
+        {"role": "system", "content": "Rule 1: Be concise."},
+        {"role": "system", "content": "Rule 2: Use examples."},
+        {"role": "user", "content": "Explain gravity"},
+    ]
+    prompt = config._build_prompt_from_messages(messages)
+    assert "Rule 1: Be concise." in prompt
+    assert "Rule 2: Use examples." in prompt
+    assert "Explain gravity" in prompt
+
+    # Case 3: user only — no wrapping
+    messages = [
+        {"role": "user", "content": "Hello"},
+    ]
+    prompt = config._build_prompt_from_messages(messages)
+    assert prompt == "Hello"
+
+    # Case 4: developer role treated like system
+    messages = [
+        {"role": "developer", "content": "You are a math tutor."},
+        {"role": "user", "content": "What is pi?"},
+    ]
+    prompt = config._build_prompt_from_messages(messages)
+    assert "You are a math tutor." in prompt
+    assert "What is pi?" in prompt
+
