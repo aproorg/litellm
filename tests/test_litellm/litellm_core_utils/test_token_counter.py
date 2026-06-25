@@ -1051,22 +1051,52 @@ def test_token_counter_with_tool_reference_block():
     assert tokens_empty >= 0
 
 
-def test_count_content_list_rejects_unknown_type():
+def test_count_content_list_skips_unknown_type():
     """
-    An unrecognized content block type must raise, and the error message must
-    enumerate the supported types (including `tool_reference`). This pins the
-    catch-all contract so a future block type isn't silently dropped.
+    Regression test: a non-standard content block (e.g. a custom block emitted
+    by a tool orchestrator) must NOT crash the token counter.
+
+    Before the fix, _count_content_list raised
+    `Invalid content item type: ...` on any unrecognized block, which bubbled
+    up as `Error getting number of tokens from content list` and broke token
+    counting for the whole message. The counter must instead skip the unknown
+    block while still counting recognized siblings.
     """
     from litellm.litellm_core_utils.token_counter import _count_content_list
 
-    with pytest.raises(ValueError) as exc_info:
-        _count_content_list(
-            count_function=len,
-            content_list=[{"type": "totally_unknown_block"}],
-            use_default_image_token_count=False,
-            default_token_count=None,
-        )
+    long_text = "the quick brown fox jumps over the lazy dog " * 20
+    text_only_tokens = _count_content_list(
+        count_function=len,
+        content_list=[{"type": "text", "text": long_text}],
+        use_default_image_token_count=False,
+        default_token_count=None,
+    )
+    assert text_only_tokens > 0
 
-    message = str(exc_info.value)
-    assert "Invalid content item type: totally_unknown_block" in message
-    assert "tool_reference" in message
+    with_unknown_tokens = _count_content_list(
+        count_function=len,
+        content_list=[
+            {"type": "text", "text": long_text},
+            {"type": "totally_unknown_block", "payload": {"k": "v"}},
+        ],
+        use_default_image_token_count=False,
+        default_token_count=None,
+    )
+    assert with_unknown_tokens == text_only_tokens
+
+    only_unknown_tokens = _count_content_list(
+        count_function=len,
+        content_list=[{"type": "weird_custom_block", "blob": "x"}],
+        use_default_image_token_count=False,
+        default_token_count=None,
+    )
+    assert only_unknown_tokens == 0
+
+    # A dict block with no `type` key at all must also be skipped, not crash.
+    no_type_tokens = _count_content_list(
+        count_function=len,
+        content_list=[{"text": "ignored because there is no type field"}],
+        use_default_image_token_count=False,
+        default_token_count=None,
+    )
+    assert no_type_tokens == 0
