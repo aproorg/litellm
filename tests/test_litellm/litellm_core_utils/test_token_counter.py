@@ -1051,22 +1051,55 @@ def test_token_counter_with_tool_reference_block():
     assert tokens_empty >= 0
 
 
-def test_count_content_list_rejects_unknown_type():
+def test_count_content_list_degrades_on_unknown_type():
     """
-    An unrecognized content block type must raise, and the error message must
-    enumerate the supported types (including `tool_reference`). This pins the
-    catch-all contract so a future block type isn't silently dropped.
+    Regression: an unrecognized content block type must NOT raise. Clients
+    legitimately send custom or newer block types; the counter must degrade
+    gracefully, still counting recognized text in the same message rather than
+    crashing the whole request.
+
+    Covers the full failure class:
+      - a dict block with an unknown `type` value
+      - a dict block missing the `type` key entirely
+      - recognized text nested inside an unknown wrapper block
     """
-    from litellm.litellm_core_utils.token_counter import _count_content_list
+    model = "gpt-3.5-turbo"
+    text_block = {"type": "text", "text": "the quick brown fox jumps over the lazy dog"}
+    baseline = token_counter_new(model=model, messages=[{"role": "user", "content": [text_block]}])
+    assert baseline > 0
 
-    with pytest.raises(ValueError) as exc_info:
-        _count_content_list(
-            count_function=len,
-            content_list=[{"type": "totally_unknown_block"}],
-            use_default_image_token_count=False,
-            default_token_count=None,
-        )
+    # Unknown `type` value: must not raise and must not drop the recognized text.
+    unknown_block = {"type": "totally_made_up_block_type_v9", "data": "irrelevant payload"}
+    with_unknown = token_counter_new(
+        model=model, messages=[{"role": "user", "content": [text_block, unknown_block]}]
+    )
+    assert isinstance(with_unknown, int) and with_unknown >= baseline
+    only_unknown = token_counter_new(
+        model=model, messages=[{"role": "user", "content": [unknown_block]}]
+    )
+    assert isinstance(only_unknown, int) and only_unknown >= 0
 
-    message = str(exc_info.value)
-    assert "Invalid content item type: totally_unknown_block" in message
-    assert "tool_reference" in message
+    # Dict block missing the `type` key entirely: must not raise at dispatch.
+    typeless_block = {"text": "extra payload that should not crash the counter"}
+    with_typeless = token_counter_new(
+        model=model, messages=[{"role": "user", "content": [text_block, typeless_block]}]
+    )
+    assert isinstance(with_typeless, int) and with_typeless >= baseline
+
+    # Recognized text nested inside an unknown wrapper must still be counted,
+    # mirroring how tool_use/tool_result recurse nested content lists.
+    def wrapper_with(nested_text):
+        return [
+            {
+                "type": "custom_wrapper_block_v9",
+                "content": [{"type": "text", "text": nested_text}],
+            }
+        ]
+
+    nested_full = token_counter_new(
+        model=model, messages=[{"role": "user", "content": wrapper_with("the quick brown fox " * 8)}]
+    )
+    nested_empty = token_counter_new(
+        model=model, messages=[{"role": "user", "content": wrapper_with("")}]
+    )
+    assert nested_full > nested_empty

@@ -710,6 +710,47 @@ def _count_anthropic_content(
     return tokens
 
 
+def _count_unknown_content_tokens(
+    content: Any,
+    count_function: TokenCounterFunction,
+    use_default_image_token_count: bool,
+    default_token_count: Optional[int],
+) -> int:
+    """
+    Best-effort token count for a content block whose `type` is unrecognized or
+    absent. Clients legitimately send custom or newer block types; rather than
+    crash, we recurse the block's values and count any recognized text, mirroring
+    how `_count_anthropic_content` traverses nested content lists. The `type`
+    discriminator itself never contributes prompt tokens, so it is skipped.
+    """
+    if isinstance(content, str):
+        return count_function(content)
+    if not isinstance(content, Mapping):
+        return 0
+
+    num_tokens = 0
+    for key, value in content.items():
+        if key == "type":
+            continue
+        if isinstance(value, str):
+            num_tokens += count_function(value)
+        elif isinstance(value, list):
+            num_tokens += _count_content_list(
+                count_function,
+                value,  # type: ignore
+                use_default_image_token_count,
+                default_token_count,
+            )
+        elif isinstance(value, Mapping):
+            num_tokens += _count_unknown_content_tokens(
+                value,
+                count_function,
+                use_default_image_token_count,
+                default_token_count,
+            )
+    return num_tokens
+
+
 def _count_content_list(
     count_function: TokenCounterFunction,
     content_list: OpenAIMessageContent,
@@ -724,27 +765,30 @@ def _count_content_list(
         for c in content_list:
             if isinstance(c, str):
                 num_tokens += count_function(c)
-            elif c["type"] == "text":
+                continue
+
+            content_type = c.get("type") if isinstance(c, dict) else None
+            if content_type == "text":
                 num_tokens += count_function(str(c.get("text", "")))
-            elif c["type"] == "image_url":
+            elif content_type == "image_url":
                 image_url = c.get("image_url")
                 num_tokens += _count_image_tokens(
                     image_url, use_default_image_token_count
                 )
-            elif c["type"] in ("tool_use", "tool_result"):
+            elif content_type in ("tool_use", "tool_result"):
                 num_tokens += _count_anthropic_content(
                     c,
                     count_function,
                     use_default_image_token_count,
                     default_token_count,
                 )
-            elif c["type"] == "thinking":
+            elif content_type == "thinking":
                 # Claude extended thinking content block
                 # Count the thinking text and skip signature (opaque signature blob)
                 thinking_text = str(c.get("thinking", ""))
                 if thinking_text:
                     num_tokens += count_function(thinking_text)
-            elif c["type"] == "tool_reference":
+            elif content_type == "tool_reference":
                 # Anthropic tool-search reference block: a lightweight pointer to
                 # a deferred tool, e.g. {"type": "tool_reference", "tool_name": ...}.
                 # The full tool definition is counted via the `tools` param, so we
@@ -756,14 +800,11 @@ def _count_content_list(
                 if tool_name:
                     num_tokens += count_function(tool_name)
             else:
-                content_type = (
-                    c.get("type", type(c).__name__)
-                    if isinstance(c, dict)
-                    else type(c).__name__
-                )
-                raise ValueError(
-                    f"Invalid content item type: {content_type}. "
-                    f"Expected str or dict with 'type' field (text, image_url, tool_use, tool_result, thinking, tool_reference)."
+                num_tokens += _count_unknown_content_tokens(
+                    c,
+                    count_function,
+                    use_default_image_token_count,
+                    default_token_count,
                 )
         return num_tokens
     except Exception as e:
