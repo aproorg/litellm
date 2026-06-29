@@ -142,6 +142,38 @@ async def test_proxy_shutdown_event_prisma_disconnect_raises_error(monkeypatch):
         await proxy_shutdown_event()
 
 
+@pytest.mark.asyncio
+async def test_proxy_shutdown_event_closes_cached_aiohttp_sessions(monkeypatch):
+    """Regression: the shutdown handler must close cached async HTTP clients so
+    aiohttp does not log 'Unclosed client session'. A BaseLLMAIOHTTPHandler
+    living in litellm.in_memory_llm_clients_cache holds an open ClientSession;
+    after proxy_shutdown_event runs the session must be closed."""
+    import litellm
+    from litellm.llms.custom_httpx.aiohttp_handler import BaseLLMAIOHTTPHandler
+
+    fake_jwt = MagicMock()
+    fake_jwt.close = AsyncMock()
+    monkeypatch.setattr(ps, "jwt_handler", fake_jwt, raising=False)
+    monkeypatch.setattr(ps, "prisma_client", None, raising=False)
+    monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
+    monkeypatch.setattr(litellm, "cache", None, raising=False)
+    monkeypatch.setattr(litellm, "success_callback", [], raising=False)
+
+    handler = BaseLLMAIOHTTPHandler()
+    session = handler._get_async_client_session()
+    assert not session.closed
+
+    cache_dict = litellm.in_memory_llm_clients_cache.cache_dict
+    cache_dict["witness-aiohttp-handler"] = handler
+    try:
+        await proxy_shutdown_event()
+        assert session.closed
+    finally:
+        cache_dict.pop("witness-aiohttp-handler", None)
+        if not session.closed:
+            await session.close()
+
+
 # ---------------------------------------------------------------------------
 # _initialize_shared_aiohttp_session
 # ---------------------------------------------------------------------------
