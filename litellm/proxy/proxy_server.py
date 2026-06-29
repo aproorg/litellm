@@ -704,6 +704,12 @@ async def proxy_shutdown_event():
     if db_writer_client is not None:
         await db_writer_client.close()  # type: ignore[reportGeneralTypeIssues]
 
+    from litellm.llms.custom_httpx.async_client_cleanup import (
+        close_litellm_async_clients,
+    )
+
+    await close_litellm_async_clients()
+
     # flush remaining langfuse logs
     if "langfuse" in litellm.success_callback:
         try:
