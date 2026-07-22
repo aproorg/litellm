@@ -185,17 +185,7 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
 
             # If session is from a different or closed loop, recreate it
             if session_loop is None or session_loop != current_loop or session_loop.is_closed():
-                # Close old session to prevent leaks
-                old_session = self.client
-                try:
-                    if not old_session.closed:
-                        try:
-                            asyncio.create_task(old_session.close())
-                        except RuntimeError:
-                            # Different event loop - can't schedule task, rely on GC
-                            verbose_logger.debug("Old session from different loop, relying on GC")
-                except Exception as e:
-                    verbose_logger.debug(f"Error closing old session: {e}")
+                self._dispose_stale_session(self.client, session_loop)
 
                 # Create a new session in the current event loop
                 if hasattr(self, "_client_factory") and callable(self._client_factory):
@@ -211,6 +201,45 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                 self.client = ClientSession()
 
         return self.client
+
+    @staticmethod
+    def _dispose_stale_session(session: ClientSession, session_loop: Optional[asyncio.AbstractEventLoop]) -> None:
+        """
+        Release a session that belongs to a different event loop before dropping it.
+
+        A ClientSession must be closed on the loop that created it. Scheduling its
+        async close() on the current loop (or relying on GC) leaves the session
+        marked open and its connector's sockets unreleased, which surfaces as
+        aiohttp's "Unclosed client session" warning and leaks file descriptors.
+
+        When the owning loop is still running we schedule close() on that loop.
+        When it is gone (None) or already closed, its selector and sockets are
+        already torn down, so we detach the connector synchronously to mark the
+        session closed and drop the dangling reference without touching the dead loop.
+        """
+        if session.closed:
+            return
+
+        if session_loop is not None and not session_loop.is_closed():
+            try:
+                session_loop.call_soon_threadsafe(lambda: asyncio.ensure_future(session.close(), loop=session_loop))
+                return
+            except RuntimeError as e:
+                verbose_logger.debug(f"Could not schedule close on owning loop, detaching instead: {e}")
+
+        detach = getattr(session, "detach", None)
+        if callable(detach):
+            detach()
+        else:  # pragma: no cover - defensive for older aiohttp without detach()
+            connector = getattr(session, "_connector", None)
+            if connector is not None:
+                connector_close = getattr(connector, "_close", None) or getattr(connector, "close", None)
+                if callable(connector_close):
+                    try:
+                        connector_close()
+                    except Exception as e:
+                        verbose_logger.debug(f"Error closing stale connector: {e}")
+            setattr(session, "_connector", None)
 
     async def _make_aiohttp_request(
         self,
