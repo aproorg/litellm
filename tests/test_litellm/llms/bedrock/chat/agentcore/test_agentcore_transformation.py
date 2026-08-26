@@ -711,7 +711,7 @@ class TestAgentCoreForwardTools:
 
         payload = config.transform_request(messages=messages, **base_kwargs)
 
-        assert payload["tools"] == tools
+        assert payload["tools"] == tuple(tools)
         assert payload["prompt"] == "what happened today"
 
     def test_multiple_tools_forwarded_verbatim(self, config, messages, base_kwargs):
@@ -722,7 +722,7 @@ class TestAgentCoreForwardTools:
 
         payload = config.transform_request(messages=messages, **base_kwargs)
 
-        assert payload["tools"] == tools
+        assert payload["tools"] == tuple(tools)
 
     def test_no_tools_key_when_opted_in_without_tools(
         self, config, messages, base_kwargs
@@ -764,7 +764,7 @@ class TestAgentCoreForwardTools:
 
         payload = config.transform_request(messages=messages, **base_kwargs)
 
-        assert payload["tools"] == [WEB_SEARCH_TOOL]
+        assert payload["tools"] == (WEB_SEARCH_TOOL,)
 
     @pytest.mark.parametrize("flag", ["false", "0", "no", "off", ""])
     def test_falsy_string_flags(self, config, messages, base_kwargs, flag):
@@ -778,18 +778,23 @@ class TestAgentCoreForwardTools:
         assert "tools" not in payload
 
     def test_flag_read_from_litellm_params(self, config, messages, base_kwargs):
-        """The flag is normally set on a proxy deployment's litellm_params."""
+        """litellm_params is the fallback source for direct transform_request callers.
+
+        Deployment-level and per-request flags both arrive in optional_params (see
+        TestAgentCoreForwardToolsEndToEnd), so this branch only serves callers that
+        build litellm_params themselves.
+        """
         base_kwargs["optional_params"] = {"tools": [WEB_SEARCH_TOOL]}
         base_kwargs["litellm_params"] = {"forward_tools": True}
 
         payload = config.transform_request(messages=messages, **base_kwargs)
 
-        assert payload["tools"] == [WEB_SEARCH_TOOL]
+        assert payload["tools"] == (WEB_SEARCH_TOOL,)
 
     def test_optional_params_wins_over_litellm_params(
         self, config, messages, base_kwargs
     ):
-        """A per-request value overrides the deployment default."""
+        """optional_params is read first, so it wins over the litellm_params fallback."""
         base_kwargs["optional_params"] = {
             "tools": [WEB_SEARCH_TOOL],
             "forward_tools": False,
@@ -803,14 +808,21 @@ class TestAgentCoreForwardTools:
     def test_payload_does_not_alias_optional_params(
         self, config, messages, base_kwargs
     ):
-        """Mutating the payload must never mutate the caller's tools list."""
+        """The payload holds an immutable copy, so it cannot alias the caller's list.
+
+        The forwarded value serializes to the same JSON array either way, so the wire
+        format is asserted here too rather than just the in-memory type.
+        """
         tools = [WEB_SEARCH_TOOL]
         base_kwargs["optional_params"] = {"tools": tools, "forward_tools": True}
 
         payload = config.transform_request(messages=messages, **base_kwargs)
-        payload["tools"].append({"type": "function", "function": {"name": "extra"}})
 
-        assert len(tools) == 1
+        assert isinstance(payload["tools"], tuple)
+        with pytest.raises(AttributeError):
+            payload["tools"].append({"type": "function", "function": {"name": "extra"}})
+        assert tools == [WEB_SEARCH_TOOL]
+        assert json.loads(json.dumps(payload))["tools"] == [WEB_SEARCH_TOOL]
 
     def test_tools_and_multimodal_content_are_independent(self, config, base_kwargs):
         """Both opt-ins together → both keys present, neither disturbs the other."""
@@ -832,7 +844,7 @@ class TestAgentCoreForwardTools:
             messages=[{"role": "user", "content": content}], **base_kwargs
         )
 
-        assert payload["tools"] == tools
+        assert payload["tools"] == tuple(tools)
         assert payload["content"] == content
         assert payload["prompt"] == "what is this"
 
@@ -890,7 +902,34 @@ class TestAgentCoreForwardToolsEndToEnd:
             headers={},
         )
 
-        assert payload["tools"] == [WEB_SEARCH_TOOL]
+        assert payload["tools"] == (WEB_SEARCH_TOOL,)
+
+    def test_flag_reaches_the_transform_via_optional_params(self):
+        """The flag itself is not an OpenAI param, so it lands in optional_params.
+
+        get_litellm_params only forwards an allowlist of keys, which excludes
+        forward_tools, so this is the path every real caller takes: both the flag and
+        the tools list arrive in optional_params and litellm_params stays empty.
+        """
+        optional_params = litellm.utils.get_optional_params(
+            model=AGENTCORE_TEST_MODEL,
+            custom_llm_provider="bedrock",
+            tools=[WEB_SEARCH_TOOL],
+            allowed_openai_params=["tools"],
+            forward_tools=True,
+        )
+
+        assert optional_params["forward_tools"] is True
+
+        payload = AmazonAgentCoreConfig().transform_request(
+            model=AGENTCORE_TEST_MODEL,
+            messages=[{"role": "user", "content": "hi"}],
+            optional_params=optional_params,
+            litellm_params={},
+            headers={},
+        )
+
+        assert payload["tools"] == (WEB_SEARCH_TOOL,)
 
     def test_allowed_openai_params_alone_does_not_forward(self):
         """Both opt-ins are required; the escape hatch alone changes nothing."""

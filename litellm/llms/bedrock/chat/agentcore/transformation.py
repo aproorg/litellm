@@ -5,7 +5,7 @@ https://docs.aws.amazon.com/bedrock/latest/APIReference/API_agentcore_InvokeAgen
 """
 
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import TYPE_CHECKING, Any, Final, Optional, Union, cast
 from urllib.parse import quote
 
@@ -227,18 +227,14 @@ class AmazonAgentCoreConfig(BaseConfig, BaseAWSLLM):
           must be explicitly written to read ``payload["content"]``; by default the
           payload stays byte-identical to the legacy ``{"prompt": "..."}`` shape.
         - ``tools`` is added ONLY when the ``forward_tools`` litellm param is truthy
-          AND the caller declared a non-empty OpenAI ``tools`` list. It carries the
-          client's tool declarations so a schemaless agent can learn what the caller
-          offered this turn. Same opt-in reasoning as ``content``.
-
-          Note that AgentCore declares no supported OpenAI params, so ``tools`` is
+          AND the caller declared a non-empty OpenAI ``tools`` list, so a schemaless
+          agent can see what the caller offered this turn. Same opt-in reasoning as
+          ``content``. AgentCore reports no supported OpenAI params, so ``tools`` is
           dropped (or rejected) before this method runs unless the caller also sets
-          ``allowed_openai_params=["tools"]``. That is deliberate: it keeps
+          ``allowed_openai_params=["tools"]``: that keeps
           ``get_supported_openai_params()`` honest about what AgentCore natively
-          supports, and makes forwarding an explicit two-step opt-in.
-
-          This is a one-way signal. AgentCore responses carry no tool-call channel,
-          so nothing here implies function-calling support.
+          supports and makes forwarding a deliberate two-step opt-in. One-way signal
+          only, since AgentCore responses carry no tool-call channel.
 
         Returns:
             dict: Payload dict containing the prompt and, optionally, the OpenAI
@@ -256,7 +252,7 @@ class AmazonAgentCoreConfig(BaseConfig, BaseAWSLLM):
         # list verbatim under "content" so an attachment-aware agent can read the raw
         # blocks (image_url, file, etc.). Default off keeps the payload byte-identical
         # to the legacy {"prompt": "..."} shape for agents that only read the prompt.
-        if self._should_forward_multimodal_content(optional_params, litellm_params):
+        if self._is_flag_enabled(optional_params, litellm_params, "forward_multimodal_content"):
             last_content: Final = messages[-1].get("content")
             if isinstance(last_content, list) and any(
                 isinstance(block, dict) and block.get("type") not in (None, "text") for block in last_content
@@ -265,16 +261,13 @@ class AmazonAgentCoreConfig(BaseConfig, BaseAWSLLM):
                 # not deep, to avoid cloning large base64 media on the request path.
                 payload["content"] = list(last_content)
 
-        # Opt-in: when forward_tools is set, forward the caller's OpenAI tool
-        # declarations verbatim under "tools" so a schemaless agent can see what the
-        # client offered for this turn. Default off keeps the payload byte-identical
-        # for agents that only read the prompt.
-        if self._should_forward_tools(optional_params, litellm_params):
+        if self._is_flag_enabled(optional_params, litellm_params, "forward_tools"):
             tools: Final = optional_params.get("tools")
             if isinstance(tools, list) and tools:
-                # Copy so the payload never aliases optional_params["tools"]; shallow,
-                # matching the content path above.
-                payload["tools"] = list(tools)
+                # Immutable shallow copy: the payload can never alias the caller's list,
+                # the nested dicts stay shared to avoid a deep clone, and json.dumps
+                # serializes a tuple to the same JSON array a list would.
+                payload["tools"] = tuple(tools)
 
         # Get or generate session ID - this goes in the header
         runtime_session_id: Final = self._get_runtime_session_id(optional_params)
@@ -292,40 +285,25 @@ class AmazonAgentCoreConfig(BaseConfig, BaseAWSLLM):
         return payload
 
     @staticmethod
-    def _should_forward_multimodal_content(optional_params: dict, litellm_params: dict) -> bool:
-        """Whether to forward raw OpenAI content blocks under ``payload["content"]``.
+    def _is_flag_enabled(
+        optional_params: Mapping[str, object],
+        litellm_params: Mapping[str, object],
+        key: str,
+    ) -> bool:
+        """Whether the ``key`` payload-forwarding flag is on, ``optional_params`` first.
 
-        Opt-in via the ``forward_multimodal_content`` litellm param (default ``False``)
-        because AgentCore agents must be explicitly written to read the field. The
-        value may arrive as a bool or a config/env string ("true", "1", ...). Checks
-        ``optional_params`` first (where other AgentCore params land), then
-        ``litellm_params``.
+        These flags are opt-in (default ``False``) because AgentCore agents must be
+        explicitly written to read the field they add, and the value may arrive as a
+        bool or as a config/env string ("true", "1", ...).
+
+        Both a deployment-level and a per-request flag reach this method through
+        ``optional_params``: ``get_litellm_params`` only forwards an allowlist of keys
+        and these are not on it, so anything unrecognized is routed to the provider
+        params instead. ``litellm_params`` is the fallback for direct
+        ``transform_request`` callers.
         """
         for source in (optional_params, litellm_params):
-            if not isinstance(source, dict):
-                continue
-            value = source.get("forward_multimodal_content")
-            if value is None:
-                continue
-            if isinstance(value, str):
-                return value.strip().lower() in ("1", "true", "yes", "on")
-            return bool(value)
-        return False
-
-    @staticmethod
-    def _should_forward_tools(optional_params: dict, litellm_params: dict) -> bool:
-        """Whether to forward the caller's tool declarations under ``payload["tools"]``.
-
-        Opt-in via the ``forward_tools`` litellm param (default ``False``) because
-        AgentCore agents must be explicitly written to read the field. The value may
-        arrive as a bool or a config/env string ("true", "1", ...). Checks
-        ``optional_params`` first (where other AgentCore params land), then
-        ``litellm_params``.
-        """
-        for source in (optional_params, litellm_params):
-            if not isinstance(source, dict):
-                continue
-            value = source.get("forward_tools")
+            value = source.get(key)
             if value is None:
                 continue
             if isinstance(value, str):
